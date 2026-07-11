@@ -17,6 +17,9 @@ pub enum SampleEntry {
     /// H.264 (AVC) 用サンプルエントリー（`avc1`）
     Avc1(Avc1Box),
 
+    /// MPEG-4 Visual 用サンプルエントリー（`mp4v`）
+    Mp4v(Mp4vBox),
+
     /// H.265 (HEVC) 用サンプルエントリー（`hev1`。パラメータセットが in-band 前提）
     Hev1(Hev1Box),
 
@@ -109,6 +112,7 @@ impl SampleEntry {
     pub fn video_resolution(&self) -> Option<(u16, u16)> {
         match self {
             Self::Avc1(b) => Some((b.visual.width, b.visual.height)),
+            Self::Mp4v(b) => Some((b.visual.width, b.visual.height)),
             Self::Hev1(b) => Some((b.visual.width, b.visual.height)),
             Self::Hvc1(b) => Some((b.visual.width, b.visual.height)),
             Self::Vp08(b) => Some((b.visual.width, b.visual.height)),
@@ -121,6 +125,7 @@ impl SampleEntry {
     fn inner_box(&self) -> &dyn BaseBox {
         match self {
             Self::Avc1(b) => b,
+            Self::Mp4v(b) => b,
             Self::Hev1(b) => b,
             Self::Hvc1(b) => b,
             Self::Vp08(b) => b,
@@ -141,6 +146,7 @@ impl Encode for SampleEntry {
     fn encode(&self, buf: &mut [u8]) -> Result<usize> {
         match self {
             Self::Avc1(b) => b.encode(buf),
+            Self::Mp4v(b) => b.encode(buf),
             Self::Hev1(b) => b.encode(buf),
             Self::Hvc1(b) => b.encode(buf),
             Self::Vp08(b) => b.encode(buf),
@@ -162,6 +168,7 @@ impl Decode for SampleEntry {
         let (header, _) = BoxHeader::decode(buf)?;
         match header.box_type {
             Avc1Box::TYPE => Avc1Box::decode(buf).map(|(b, n)| (Self::Avc1(b), n)),
+            Mp4vBox::TYPE => Mp4vBox::decode(buf).map(|(b, n)| (Self::Mp4v(b), n)),
             Hev1Box::TYPE => Hev1Box::decode(buf).map(|(b, n)| (Self::Hev1(b), n)),
             Hvc1Box::TYPE => Hvc1Box::decode(buf).map(|(b, n)| (Self::Hvc1(b), n)),
             Vp08Box::TYPE => Vp08Box::decode(buf).map(|(b, n)| (Self::Vp08(b), n)),
@@ -367,6 +374,84 @@ impl BaseBox for Avc1Box {
         Box::new(
             core::iter::empty()
                 .chain(core::iter::once(&self.avcc_box).map(as_box_object))
+                .chain(self.unknown_boxes.iter().map(as_box_object)),
+        )
+    }
+}
+
+/// [ISO/IEC 14496-14] MP4VisualSampleEntry class
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[expect(missing_docs)]
+pub struct Mp4vBox {
+    pub visual: VisualSampleEntryFields,
+    pub esds_box: EsdsBox,
+    pub unknown_boxes: Vec<UnknownBox>,
+}
+
+impl Mp4vBox {
+    /// ボックス種別
+    pub const TYPE: BoxType = BoxType::Normal(*b"mp4v");
+}
+
+impl Encode for Mp4vBox {
+    fn encode(&self, buf: &mut [u8]) -> Result<usize> {
+        let header = BoxHeader::new_variable_size(Self::TYPE);
+        let mut offset = header.encode(buf)?;
+        offset += self.visual.encode(&mut buf[offset..])?;
+        offset += self.esds_box.encode(&mut buf[offset..])?;
+        for b in &self.unknown_boxes {
+            offset += b.encode(&mut buf[offset..])?;
+        }
+        header.finalize_box_size(&mut buf[..offset])?;
+        Ok(offset)
+    }
+}
+
+impl Decode for Mp4vBox {
+    fn decode(buf: &[u8]) -> Result<(Self, usize)> {
+        with_box_type(Self::TYPE, || {
+            let (header, payload) = BoxHeader::decode_header_and_payload(buf)?;
+            header.box_type.expect(Self::TYPE)?;
+
+            let mut offset = 0;
+            let visual = VisualSampleEntryFields::decode_at(payload, &mut offset)?;
+
+            let mut esds_box = None;
+            let mut unknown_boxes = Vec::new();
+
+            while offset < payload.len() {
+                let (child_header, _) = BoxHeader::decode(&payload[offset..])?;
+                match child_header.box_type {
+                    EsdsBox::TYPE if esds_box.is_none() => {
+                        esds_box = Some(EsdsBox::decode_at(payload, &mut offset)?);
+                    }
+                    _ => {
+                        unknown_boxes.push(UnknownBox::decode_at(payload, &mut offset)?);
+                    }
+                }
+            }
+
+            Ok((
+                Self {
+                    visual,
+                    esds_box: check_mandatory_box(esds_box, "esds", "mp4v")?,
+                    unknown_boxes,
+                },
+                header.external_size() + payload.len(),
+            ))
+        })
+    }
+}
+
+impl BaseBox for Mp4vBox {
+    fn box_type(&self) -> BoxType {
+        Self::TYPE
+    }
+
+    fn children<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = &'a dyn BaseBox>> {
+        Box::new(
+            core::iter::empty()
+                .chain(core::iter::once(&self.esds_box).map(as_box_object))
                 .chain(self.unknown_boxes.iter().map(as_box_object)),
         )
     }

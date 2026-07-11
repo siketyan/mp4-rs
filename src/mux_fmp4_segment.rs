@@ -1154,6 +1154,7 @@ pub(crate) fn subtitle_trak_attributes(sample_entry: &SampleEntry) -> ([u8; 4], 
 fn extract_video_dimensions(sample_entry: &SampleEntry) -> Result<TkhdDimensions, MuxError> {
     let visual = match sample_entry {
         SampleEntry::Avc1(b) => Some(&b.visual),
+        SampleEntry::Mp4v(b) => Some(&b.visual),
         SampleEntry::Hev1(b) => Some(&b.visual),
         SampleEntry::Hvc1(b) => Some(&b.visual),
         SampleEntry::Vp08(b) => Some(&b.visual),

@@ -11,6 +11,9 @@
 
 ## develop
 
+- [ADD] MPEG-4 Visual の `Mp4vBox` と `SampleEntry::Mp4v` を追加する
+  - `codec_string::from_sample_entry` は OTI が `0x20` のときのみ VisualObjectSequence から profile_and_level_indication を読む
+
 ## 2026.5.0
 
 - [ADD] `SampleEntry` から RFC 6381 および各コーデック binding の `codecs` パラメーター文字列を生成する API (`codec_string::from_sample_entry`) を追加する

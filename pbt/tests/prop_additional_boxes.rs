@@ -10,8 +10,8 @@ use shiguredo_mp4::{
     boxes::{
         AudioSampleEntryFields, Av01Box, Av1cBox, Avc1Box, AvccBox, BoxRecord, DflaBox, DopsBox,
         EsdsBox, FlacBox, FlacMetadataBlock, FontRecord, FreeBox, FtabBox, Hev1Box, Hvc1Box,
-        HvccBox, MdatBox, Mp4aBox, OpusBox, StppBox, StyleRecord, Tx3gBox, UnknownBox,
-        VisualSampleEntryFields, Vp08Box, Vp09Box, VpccBox, VttCBox, WvttBox,
+        HvccBox, MdatBox, Mp4aBox, Mp4vBox, OpusBox, SampleEntry, StppBox, StyleRecord, Tx3gBox,
+        UnknownBox, VisualSampleEntryFields, Vp08Box, Vp09Box, VpccBox, VttCBox, WvttBox,
     },
     descriptors::{DecoderConfigDescriptor, DecoderSpecificInfo, EsDescriptor, SlConfigDescriptor},
 };
@@ -108,6 +108,44 @@ fn arb_esds_box(ctx: &mut TestCaseContext) -> EsdsBox {
                 stream_type: Uint::new(0x05),
                 up_stream: Uint::new(0),
                 buffer_size_db: Uint::new(0),
+                max_bitrate,
+                avg_bitrate,
+                dec_specific_info: dec_specific_info.map(|payload| DecoderSpecificInfo { payload }),
+            },
+            sl_config_descr: SlConfigDescriptor,
+        },
+    }
+}
+
+/// EsdsBox (MPEG-2 Video) を生成する
+fn arb_mpeg2_video_esds_box(ctx: &mut TestCaseContext) -> EsdsBox {
+    let es_id = noprop::sample_u64_in(ctx, 1..=u16::MAX as u64) as u16;
+    let stream_priority = noprop::sample_u64_in(ctx, 0..32) as u8;
+    // MPEG-2 Video のプロファイル別 objectTypeIndication (0x60..=0x65)
+    let object_type_indication = noprop::sample_u64_in(ctx, 0x60..=0x65) as u8;
+    // bufferSizeDB は 24 ビット幅なので上位 8 ビットを落とす
+    let buffer_size_db = noprop::sample_u32(ctx) & 0x00FF_FFFF;
+    let max_bitrate = noprop::sample_u32(ctx);
+    let avg_bitrate = noprop::sample_u32(ctx);
+    let dec_specific_info = if noprop::sample_bool(ctx) {
+        let len = noprop::sample_usize_in(ctx, 0..20);
+        Some(noprop::sample_bytes_vec(ctx, len))
+    } else {
+        None
+    };
+    EsdsBox {
+        es: EsDescriptor {
+            es_id,
+            stream_priority: Uint::new(stream_priority),
+            depends_on_es_id: None,
+            url_string: None,
+            ocr_es_id: None,
+            dec_config_descr: DecoderConfigDescriptor {
+                object_type_indication,
+                // 0x04 は VisualStream を表す streamType
+                stream_type: Uint::new(0x04),
+                up_stream: Uint::new(0),
+                buffer_size_db: Uint::new(buffer_size_db),
                 max_bitrate,
                 avg_bitrate,
                 dec_specific_info: dec_specific_info.map(|payload| DecoderSpecificInfo { payload }),
@@ -518,6 +556,32 @@ fn mp4a_box_roundtrip() -> noprop::TestResult {
         assert_eq!(size, encoded.len());
         assert_eq!(decoded.audio.channelcount, mp4a.audio.channelcount);
         assert_eq!(decoded.esds_box.es.es_id, mp4a.esds_box.es.es_id);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Mp4vBox の encode/decode roundtrip
+#[test]
+fn mp4v_box_roundtrip() -> noprop::TestResult {
+    let seed = noprop::seed_from_env_or_time("MP4_RS_PBT_SEED")?;
+    noprop::Runner::new(seed).run(CASES, |ctx| {
+        let visual = arb_visual_sample_entry(ctx);
+        let esds = arb_mpeg2_video_esds_box(ctx);
+        let mp4v = Mp4vBox {
+            visual,
+            esds_box: esds,
+            unknown_boxes: vec![],
+        };
+        let expected_resolution = (mp4v.visual.width, mp4v.visual.height);
+        let entry = SampleEntry::Mp4v(mp4v);
+        let encoded = entry.encode_to_vec().expect("Vec への書き込みは失敗しない");
+        let (decoded, size) = SampleEntry::decode(&encoded)
+            .expect("直前にエンコードした有効な Mp4v サンプルエントリーは必ずデコードできる");
+
+        assert_eq!(size, encoded.len());
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.video_resolution(), Some(expected_resolution));
         Ok(())
     })?;
     Ok(())

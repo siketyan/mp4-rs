@@ -8,8 +8,8 @@ use crate::{
     BoxType, Error, Result,
     bitstream::h264::H264ProfileLevelId,
     boxes::{
-        Av01Box, Av1cBox, Avc1Box, AvccBox, FlacBox, Hev1Box, Hvc1Box, HvccBox, Mp4aBox, OpusBox,
-        SampleEntry, StppBox, Tx3gBox, Vp08Box, Vp09Box, VpccBox, WvttBox,
+        Av01Box, Av1cBox, Avc1Box, AvccBox, FlacBox, Hev1Box, Hvc1Box, HvccBox, Mp4aBox, Mp4vBox,
+        OpusBox, SampleEntry, StppBox, Tx3gBox, Vp08Box, Vp09Box, VpccBox, WvttBox,
     },
     descriptors::DecoderConfigDescriptor,
 };
@@ -28,6 +28,8 @@ use crate::{
 /// - `Vp08` / `Vp09`: [`VpccBox`] の profile / level / bit depth から VP バインディングの形を組み立てる（例: `vp09.00.31.08`）
 /// - `Mp4a`: [`DecoderConfigDescriptor`] の object type indication に加え、OTI が `0x40` のときは
 ///   AudioSpecificConfig 先頭から audio object type を読む（例: `mp4a.40.2`）
+/// - `Mp4v`: [`DecoderConfigDescriptor`] の object type indication に加え、OTI が `0x20` のときは
+///   VisualObjectSequence 先頭から profile_and_level_indication を読む（例: `mp4v.20.9`、MPEG-2 Video は `mp4v.61`）
 /// - `Opus` / `Flac` / `Stpp` / `Wvtt` / `Tx3g`: バインディングで追加パラメーターが不要なため、
 ///   サンプルエントリーの 4CC だけを返す（`Opus` / `fLaC` / `stpp` / `wvtt` / `tx3g`）
 ///
@@ -79,6 +81,8 @@ use crate::{
 /// - [`SampleEntry::Unknown`]: 未知のサンプルエントリーは解釈できないため [`ErrorKind::Unsupported`][crate::ErrorKind::Unsupported]
 /// - `mp4a` かつ OTI が `0x40` なのに `DecoderSpecificInfo` が欠落、または AOT ビット列が切り詰められている:
 ///   [`ErrorKind::InvalidData`][crate::ErrorKind::InvalidData]
+/// - `mp4v` かつ OTI が `0x20` なのに `DecoderSpecificInfo` が欠落、または VisualObjectSequence が
+///   見つからない・切り詰められている: [`ErrorKind::InvalidData`][crate::ErrorKind::InvalidData]
 pub fn from_sample_entry(entry: &SampleEntry) -> Result<String> {
     match entry {
         SampleEntry::Avc1(b) => Ok(avc1_codec_string(&b.avcc_box)),
@@ -88,6 +92,7 @@ pub fn from_sample_entry(entry: &SampleEntry) -> Result<String> {
         SampleEntry::Vp08(b) => Ok(vp_codec_string(Vp08Box::TYPE, &b.vpcc_box)),
         SampleEntry::Vp09(b) => Ok(vp_codec_string(Vp09Box::TYPE, &b.vpcc_box)),
         SampleEntry::Mp4a(b) => mp4a_codec_string(&b.esds_box.es.dec_config_descr),
+        SampleEntry::Mp4v(b) => mp4v_codec_string(&b.esds_box.es.dec_config_descr),
         SampleEntry::Opus(_) => Ok(format!("{}", OpusBox::TYPE)),
         SampleEntry::Flac(_) => Ok(format!("{}", FlacBox::TYPE)),
         SampleEntry::Stpp(_) => Ok(format!("{}", StppBox::TYPE)),
@@ -205,6 +210,56 @@ fn mp4a_codec_string(dec_config: &DecoderConfigDescriptor) -> Result<String> {
     }
 
     Ok(s)
+}
+
+/// ISO/IEC 14496-2 Visual を表す `objectTypeIndication` の値
+const OBJECT_TYPE_INDICATION_VISUAL_ISO_IEC_14496_2: u8 = 0x20;
+
+/// MPEG-4 Visual: `mp4v.` + OTI の 2 桁小文字 hex（RFC 6381）
+///
+/// `mp4v` サンプルエントリーは MPEG-4 Visual 以外（MPEG-2 Video / MPEG-1 Video など）も
+/// OTI で区別して収容するため、OTI が `0x20` のときだけ RFC 6381 が要求する
+/// profile_and_level_indication を付加し、それ以外は OTI までで打ち切る。
+fn mp4v_codec_string(dec_config: &DecoderConfigDescriptor) -> Result<String> {
+    let oti = dec_config.object_type_indication;
+    let mut s = format!("{}.{:02x}", Mp4vBox::TYPE, oti);
+
+    if oti == OBJECT_TYPE_INDICATION_VISUAL_ISO_IEC_14496_2 {
+        let Some(info) = &dec_config.dec_specific_info else {
+            return Err(Error::invalid_data(
+                "mp4v object type 0x20 requires DecoderSpecificInfo for codecs string",
+            ));
+        };
+        let pli = visual_profile_level_indication_from_vos(&info.payload)?;
+        s.push('.');
+        s.push_str(&format!("{pli:x}"));
+    }
+
+    Ok(s)
+}
+
+/// VisualObjectSequence 先頭から `profile_and_level_indication` だけを読む
+///
+/// MPEG-4 Visual の DecoderSpecificInfo は VisualObjectSequence から始まり、
+/// 開始コード `00 00 01 B0` の直後の 1 バイトが profile_and_level_indication となる。
+/// ここではその 1 バイトだけを取り出し、値そのものの妥当性は検証しない。
+fn visual_profile_level_indication_from_vos(payload: &[u8]) -> Result<u8> {
+    const VOS_START_CODE: [u8; 4] = [0x00, 0x00, 0x01, 0xB0];
+
+    let Some(start) = payload
+        .windows(VOS_START_CODE.len())
+        .position(|window| window == VOS_START_CODE)
+    else {
+        return Err(Error::invalid_data(
+            "DecoderSpecificInfo does not contain a VisualObjectSequence start code",
+        ));
+    };
+
+    payload.get(start + VOS_START_CODE.len()).copied().ok_or_else(|| {
+        Error::invalid_data(
+            "DecoderSpecificInfo is truncated at VisualObjectSequence profile_and_level_indication",
+        )
+    })
 }
 
 /// AudioSpecificConfig 先頭から `audioObjectType` だけを読む

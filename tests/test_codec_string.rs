@@ -9,9 +9,9 @@ use shiguredo_mp4::{
     BoxSize, BoxType, ErrorKind, FixedPointNumber, Uint, Utf8String,
     boxes::{
         AudioSampleEntryFields, Av01Box, Av1cBox, Avc1Box, AvccBox, BoxRecord, DflaBox, DopsBox,
-        EsdsBox, FlacBox, FlacMetadataBlock, FtabBox, Hev1Box, Hvc1Box, HvccBox, Mp4aBox, OpusBox,
-        SampleEntry, StppBox, StyleRecord, Tx3gBox, UnknownBox, VisualSampleEntryFields, Vp08Box,
-        Vp09Box, VpccBox, VttCBox, WvttBox,
+        EsdsBox, FlacBox, FlacMetadataBlock, FtabBox, Hev1Box, Hvc1Box, HvccBox, Mp4aBox, Mp4vBox,
+        OpusBox, SampleEntry, StppBox, StyleRecord, Tx3gBox, UnknownBox, VisualSampleEntryFields,
+        Vp08Box, Vp09Box, VpccBox, VttCBox, WvttBox,
     },
     codec_string,
     descriptors::{DecoderConfigDescriptor, DecoderSpecificInfo, EsDescriptor, SlConfigDescriptor},
@@ -511,6 +511,89 @@ fn mp4a_empty_asc_is_invalid_data() {
 fn mp4a_truncated_escaped_aot_is_invalid_data() {
     // AOT 31 だが 2 バイト目が無い
     let entry = mp4a_with_asc(Some(vec![0xF8]));
+    let err = codec_string::from_sample_entry(&entry).expect_err("切り詰めはエラー");
+    assert_eq!(err.kind, ErrorKind::InvalidData);
+}
+
+fn mp4v_with_dsi(object_type_indication: u8, payload: Option<Vec<u8>>) -> SampleEntry {
+    SampleEntry::Mp4v(Mp4vBox {
+        visual: visual_fields(),
+        esds_box: EsdsBox {
+            es: EsDescriptor {
+                es_id: 1,
+                stream_priority: Uint::new(0),
+                depends_on_es_id: None,
+                url_string: None,
+                ocr_es_id: None,
+                dec_config_descr: DecoderConfigDescriptor {
+                    object_type_indication,
+                    // 0x04 は VisualStream を表す streamType
+                    stream_type: Uint::new(0x04),
+                    up_stream: Uint::new(0),
+                    buffer_size_db: Uint::new(0),
+                    max_bitrate: 4000000,
+                    avg_bitrate: 4000000,
+                    dec_specific_info: payload.map(|payload| DecoderSpecificInfo { payload }),
+                },
+                sl_config_descr: SlConfigDescriptor,
+            },
+        },
+        unknown_boxes: vec![],
+    })
+}
+
+/// MPEG-4 Visual Simple Profile Level 3 (PLI 0x09): `mp4v.20.9`
+#[test]
+fn mp4v_visual_simple_profile() {
+    // VisualObjectSequence 開始コードの直後が profile_and_level_indication
+    let entry = mp4v_with_dsi(0x20, Some(vec![0x00, 0x00, 0x01, 0xB0, 0x09]));
+    assert_eq!(
+        codec_string::from_sample_entry(&entry).expect("Mp4v MPEG-4 Visual は成功する"),
+        "mp4v.20.9"
+    );
+}
+
+/// PLI が 2 桁になる値でも小文字 hex で表記する
+#[test]
+fn mp4v_visual_two_digit_profile_level() {
+    // PLI 0xF5 (Advanced Simple Profile Level 5)
+    let entry = mp4v_with_dsi(0x20, Some(vec![0x00, 0x00, 0x01, 0xB0, 0xF5]));
+    assert_eq!(
+        codec_string::from_sample_entry(&entry).expect("2 桁 PLI は成功する"),
+        "mp4v.20.f5"
+    );
+}
+
+/// OTI が 0x20 以外（MPEG-2 Video Main Profile）なら PLI を付けない
+#[test]
+fn mp4v_non_0x20_oti_without_profile_level() {
+    let entry = mp4v_with_dsi(0x61, None);
+    assert_eq!(
+        codec_string::from_sample_entry(&entry).expect("非 0x20 OTI は成功する"),
+        "mp4v.61"
+    );
+}
+
+/// OTI 0x20 で DecoderSpecificInfo 欠落は InvalidData（PLI を仮定しない）
+#[test]
+fn mp4v_missing_dsi_is_invalid_data() {
+    let entry = mp4v_with_dsi(0x20, None);
+    let err = codec_string::from_sample_entry(&entry).expect_err("DSI 欠落はエラー");
+    assert_eq!(err.kind, ErrorKind::InvalidData);
+}
+
+/// OTI 0x20 で VisualObjectSequence 開始コードが無いのは InvalidData
+#[test]
+fn mp4v_missing_vos_start_code_is_invalid_data() {
+    let entry = mp4v_with_dsi(0x20, Some(vec![0x00, 0x00, 0x01, 0xB5, 0x09]));
+    let err = codec_string::from_sample_entry(&entry).expect_err("開始コード無しはエラー");
+    assert_eq!(err.kind, ErrorKind::InvalidData);
+}
+
+/// OTI 0x20 で開始コード直後が欠けているのは InvalidData
+#[test]
+fn mp4v_truncated_vos_is_invalid_data() {
+    let entry = mp4v_with_dsi(0x20, Some(vec![0x00, 0x00, 0x01, 0xB0]));
     let err = codec_string::from_sample_entry(&entry).expect_err("切り詰めはエラー");
     assert_eq!(err.kind, ErrorKind::InvalidData);
 }
