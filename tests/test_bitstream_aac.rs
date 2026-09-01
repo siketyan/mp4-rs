@@ -883,3 +883,79 @@ fn real_adts_all_frames_parse() {
     }
     assert!(count >= 2, "fixture に複数フレームが含まれること");
 }
+
+// ===== SamplingFrequency::from_index / ChannelConfiguration::from_raw =====
+
+/// index 0..=12 は対応表の周波数になる
+#[test]
+fn sampling_frequency_from_index_table() {
+    // (index, Hz) の対応表 (ISO/IEC 14496-3 Table 1.18)
+    for (index, hz) in [
+        (0u8, 96000u32),
+        (3, 48000),
+        (4, 44100),
+        (6, 24000),
+        (12, 7350),
+    ] {
+        let frequency = SamplingFrequency::from_index(index).expect("index 0..=12 は生成成功する");
+        assert_eq!(frequency.hz(), hz);
+    }
+}
+
+/// index 13 / 14 (reserved) と 15 (明示形式) は拒否する
+#[test]
+fn sampling_frequency_from_index_rejects_reserved_and_explicit() {
+    for index in [13u8, 14, 15, 16, 255] {
+        let err =
+            SamplingFrequency::from_index(index).expect_err(&format!("index {index} は拒否される"));
+        assert_eq!(err.kind, ErrorKind::InvalidInput);
+    }
+}
+
+/// from_index と from_hz は同じ正規形になる
+#[test]
+fn sampling_frequency_from_index_matches_from_hz() {
+    let from_index = SamplingFrequency::from_index(3).expect("index 3 は生成成功する");
+    let from_hz = SamplingFrequency::from_hz(48000).expect("48000 は生成成功する");
+    assert_eq!(from_index, from_hz);
+}
+
+/// channelConfiguration 1..=7 を受理する
+#[test]
+fn channel_configuration_from_raw_accepts_1_to_7() {
+    for raw in 1u8..=7 {
+        let channel_configuration =
+            ChannelConfiguration::from_raw(raw).expect("1..=7 は生成成功する");
+        assert_eq!(channel_configuration.as_u8(), raw);
+    }
+    // 7 だけチャンネル数が値と一致しない (7.1)
+    assert_eq!(
+        ChannelConfiguration::from_raw(7)
+            .expect("7 は生成成功する")
+            .channel_count(),
+        8
+    );
+}
+
+/// channelConfiguration 0 (PCE) と 8..=15 (reserved) は拒否する
+#[test]
+fn channel_configuration_from_raw_rejects_pce_and_reserved() {
+    for raw in [0u8, 8, 15] {
+        let err = ChannelConfiguration::from_raw(raw)
+            .expect_err(&format!("channelConfiguration {raw} は拒否される"));
+        assert_eq!(err.kind, ErrorKind::InvalidInput);
+    }
+}
+
+/// AdtsHeader::sampling_frequency がヘッダーの index に対応する周波数を返す
+#[test]
+fn adts_header_sampling_frequency() {
+    // 44.1 kHz (index 4) / stereo の最小フレーム
+    let mut frame = build_adts_header(0xFFF, 0, 0, 1, 1, 4, 0, 2, 0, 0, 0, 0, 9, 0x7FF, 0, None);
+    frame.extend_from_slice(&[0xDE, 0xAD]);
+
+    let (header, _) = parse_adts_frame(&frame).expect("ADTS フレームは解析成功する");
+
+    assert_eq!(header.sampling_frequency_index, 4);
+    assert_eq!(header.sampling_frequency().hz(), 44100);
+}

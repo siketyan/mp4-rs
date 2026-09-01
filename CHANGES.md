@@ -11,6 +11,10 @@
 
 ## develop
 
+- [ADD] `bitstream::aac` に index / 生値からの構築 API を追加する
+  - `SamplingFrequency::from_index` (`samplingFrequencyIndex` 0..=12 から生成する)
+  - `ChannelConfiguration::from_raw` (生の `channelConfiguration` 1..=7 から生成する)
+  - `AdtsHeader::sampling_frequency` (解析済みヘッダーの index に対応する周波数を返す)
 - [ADD] `bitstream::h265::parse_sps` が SPS の VUI から timing 情報と `min_spatial_segmentation_idc` を読む
   - `H265Sps` に `vui_timing_info` (`H265VuiTimingInfo`) と `min_spatial_segmentation_idc` を追加する
   - VUI に到達するため `st_ref_pic_set` の `NumDeltaPocs` 導出 (7.4.8) を含む SPS 末尾の構文を読み進める

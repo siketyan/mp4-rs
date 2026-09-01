@@ -115,6 +115,27 @@ impl SamplingFrequency {
         }
     }
 
+    /// ビットストリーム上の `samplingFrequencyIndex` (0..=12) から生成する
+    ///
+    /// ADTS ヘッダーや LATM の `StreamMuxConfig` のように、Hz ではなく index を
+    /// 直接持つ入力から組み立てるための API。
+    ///
+    /// # エラー条件
+    ///
+    /// `index` が 13 / 14 (reserved) 以上の場合に [`crate::Error`] を返す。
+    /// 明示形式 (index `0xF`) は Hz が分かっているので [`Self::from_hz()`] を使う
+    pub fn from_index(index: u8) -> Result<Self> {
+        let Some(frequency) = SAMPLING_FREQUENCIES.get(index as usize).copied() else {
+            return Err(Error::invalid_input(
+                "AAC sampling frequency index must be 0..=12",
+            ));
+        };
+        Ok(Self {
+            index: Some(index),
+            frequency,
+        })
+    }
+
     /// 実効サンプリング周波数 (Hz)
     ///
     /// index 形式は対応表 (index 0..=12) の値、明示形式は保持値を返す。本構造体は
@@ -160,6 +181,17 @@ pub enum ChannelConfiguration {
 }
 
 impl ChannelConfiguration {
+    /// ビットストリーム上の生の `channelConfiguration` 値から生成する
+    ///
+    /// # エラー条件
+    ///
+    /// 0 (PCE) と 8..=15 (reserved) は本モジュールが受理しないため
+    /// [`crate::Error`] を返す
+    pub fn from_raw(raw: u8) -> Result<Self> {
+        channel_configuration_from_raw(raw)
+            .ok_or_else(|| Error::invalid_input("AAC channel configuration must be 1..=7"))
+    }
+
     /// ビットストリーム上の `channelConfiguration` 値
     pub const fn as_u8(self) -> u8 {
         match self {
@@ -234,6 +266,17 @@ pub struct AdtsHeader {
     pub original_copy: bool,
     /// `home` ビット
     pub home: bool,
+}
+
+impl AdtsHeader {
+    /// ヘッダーの `samplingFrequencyIndex` に対応するサンプリング周波数
+    ///
+    /// [`parse_adts_frame`] が index 0..=12 のみ受理するため、常に index 形式の
+    /// [`SamplingFrequency`] を返す。
+    pub fn sampling_frequency(&self) -> SamplingFrequency {
+        SamplingFrequency::from_index(self.sampling_frequency_index)
+            .expect("parse_adts_frame が index 0..=12 のみ受理する")
+    }
 }
 
 /// ADTS フレーム組み立て時に呼び出し側が指定する値
@@ -311,10 +354,7 @@ pub fn parse_audio_specific_config(input: &[u8]) -> Result<AudioSpecificConfig> 
 
     let sampling_frequency_index = reader.read_bits(4)? as u8;
     let sampling_frequency = match sampling_frequency_index {
-        0..=12 => SamplingFrequency {
-            index: Some(sampling_frequency_index),
-            frequency: SAMPLING_FREQUENCIES[sampling_frequency_index as usize],
-        },
+        0..=12 => SamplingFrequency::from_index(sampling_frequency_index)?,
         15 => {
             // index 0xF は後続 24 ビットの明示周波数 (Hz)
             let frequency = reader.read_bits(24)?;
