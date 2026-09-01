@@ -120,12 +120,21 @@ impl SpsParams {
 }
 
 /// NAL ヘッダー (type 33 / layer 0 / TemporalId 0) 付きの SPS EBSP を組み立てる
+///
+/// `bit_depth_chroma_minus8` までで打ち切るため、VUI を含む SPS は
+/// [`build_sps_with_tail`] を使う。
 fn build_sps(p: &SpsParams) -> Vec<u8> {
     let mut w = BitWriter::new();
     // NAL ヘッダー: forbidden_zero_bit = 0 / nal_unit_type = 33 / nuh_layer_id = 0 /
     // nuh_temporal_id_plus1 = 1 (TemporalId = 0)
     w.push_bits(0x42, 8);
     w.push_bits(0x01, 8);
+    push_sps_body(&mut w, p);
+    w.into_bytes()
+}
+
+/// NAL ヘッダーを除く `seq_parameter_set_data` を `bit_depth_chroma_minus8` まで書き込む
+fn push_sps_body(w: &mut BitWriter, p: &SpsParams) {
     w.push_bits(0, 4); // sps_video_parameter_set_id
     w.push_bits(u64::from(p.sps_max_sub_layers_minus1), 3);
     w.push_bit(u8::from(p.sps_temporal_id_nesting_flag));
@@ -172,7 +181,336 @@ fn build_sps(p: &SpsParams) -> Vec<u8> {
     }
     w.push_ue(u32::from(p.bit_depth_luma_minus8));
     w.push_ue(u32::from(p.bit_depth_chroma_minus8));
-    w.into_bytes()
+}
+
+/// SPS の `bit_depth_chroma_minus8` より後ろ (VUI まで) の構築パラメタ
+///
+/// VUI に到達するまでに読み飛ばす構文を切り替えて、パーサーのビット位置が
+/// ずれないことを確かめるために使う。
+#[derive(Debug, Clone, Copy)]
+struct SpsTailParams {
+    /// `sps_sub_layer_ordering_info_present_flag`
+    sub_layer_ordering_info_present: bool,
+    /// `scaling_list_enabled_flag` と `sps_scaling_list_data_present_flag` を共に立てる
+    scaling_list: bool,
+    /// `pcm_enabled_flag`
+    pcm: bool,
+    /// `st_ref_pic_set` の構成
+    st_ref_pic_sets: StRefPicSets,
+    /// `num_long_term_ref_pics_sps` (0 なら `long_term_ref_pics_present_flag = 0`)
+    long_term_ref_pics: u32,
+    /// VUI (`None` なら `vui_parameters_present_flag = 0`)
+    vui: Option<VuiParams>,
+}
+
+impl SpsTailParams {
+    /// 読み飛ばし構文を最小にして VUI だけを載せる構成
+    fn with_vui(vui: VuiParams) -> Self {
+        Self {
+            sub_layer_ordering_info_present: false,
+            scaling_list: false,
+            pcm: false,
+            st_ref_pic_sets: StRefPicSets::None,
+            long_term_ref_pics: 0,
+            vui: Some(vui),
+        }
+    }
+}
+
+/// テストで書き込む `st_ref_pic_set` の構成
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StRefPicSets {
+    /// `num_short_term_ref_pic_sets = 0`
+    None,
+    /// 明示的な集合 1 個 (負 2 個 / 正 1 個)
+    Single,
+    /// 明示的な集合 1 個 + `inter_ref_pic_set_prediction_flag == 1` の集合 2 個
+    Predicted,
+}
+
+/// VUI (ITU-T H.265 E.2.1) の構築パラメタ
+#[derive(Debug, Clone, Copy)]
+struct VuiParams {
+    /// `vui_timing_info_present_flag == 1` のときの
+    /// (`vui_num_units_in_tick`, `vui_time_scale`)
+    timing: Option<(u32, u32)>,
+    /// `vui_hrd_parameters_present_flag` (`timing` が `Some` のときだけ意味を持つ)
+    hrd: bool,
+    /// `sub_pic_hrd_params_present_flag` (`hrd` が真のときだけ意味を持つ)
+    sub_pic_hrd: bool,
+    /// `bitstream_restriction_flag == 1` のときの `min_spatial_segmentation_idc`
+    min_spatial_segmentation_idc: Option<u32>,
+}
+
+impl VuiParams {
+    /// timing も bitstream restriction も持たない VUI
+    fn empty() -> Self {
+        Self {
+            timing: None,
+            hrd: false,
+            sub_pic_hrd: false,
+            min_spatial_segmentation_idc: None,
+        }
+    }
+}
+
+/// テストで書き込む `log2_max_pic_order_cnt_lsb_minus4`
+///
+/// `lt_ref_pic_poc_lsb_sps` の幅 (`+ 4` ビット) を決める
+const TEST_LOG2_MAX_PIC_ORDER_CNT_LSB_MINUS4: u32 = 4;
+
+/// 末尾 (VUI まで) を含む SPS を組み立てて EBSP 化する
+///
+/// 末尾には 32 ビットの timing 値など任意のバイト列が載るため、
+/// `00 00 03` が現れても壊れないよう本文だけを EBSP 化して NAL ヘッダーに繋ぐ。
+fn build_sps_with_tail(p: &SpsParams, t: &SpsTailParams) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    push_sps_body(&mut w, p);
+    push_sps_tail(&mut w, p, t);
+
+    // NAL ヘッダー: nal_unit_type = 33 / nuh_layer_id = 0 / TemporalId = 0
+    let mut nal = vec![0x42, 0x01];
+    nal.extend_from_slice(&to_ebsp(&w.into_bytes()));
+    nal
+}
+
+/// `bit_depth_chroma_minus8` の続きから VUI までを書き込む (7.3.2.2.1)
+fn push_sps_tail(w: &mut BitWriter, p: &SpsParams, t: &SpsTailParams) {
+    w.push_ue(TEST_LOG2_MAX_PIC_ORDER_CNT_LSB_MINUS4);
+    w.push_bit(u8::from(t.sub_layer_ordering_info_present));
+    // present なら 0..=sps_max_sub_layers_minus1、非 present なら最上位の 1 個だけ
+    let ordering_info_count = if t.sub_layer_ordering_info_present {
+        u32::from(p.sps_max_sub_layers_minus1) + 1
+    } else {
+        1
+    };
+    for _ in 0..ordering_info_count {
+        w.push_ue(1); // sps_max_dec_pic_buffering_minus1
+        w.push_ue(0); // sps_max_num_reorder_pics
+        w.push_ue(0); // sps_max_latency_increase_plus1
+    }
+
+    w.push_ue(0); // log2_min_luma_coding_block_size_minus3
+    w.push_ue(3); // log2_diff_max_min_luma_coding_block_size
+    w.push_ue(0); // log2_min_luma_transform_block_size_minus2
+    w.push_ue(3); // log2_diff_max_min_luma_transform_block_size
+    w.push_ue(0); // max_transform_hierarchy_depth_inter
+    w.push_ue(0); // max_transform_hierarchy_depth_intra
+
+    w.push_bit(u8::from(t.scaling_list));
+    if t.scaling_list {
+        w.push_bit(1); // sps_scaling_list_data_present_flag
+        push_scaling_list_data(w);
+    }
+
+    w.push_bit(0); // amp_enabled_flag
+    w.push_bit(1); // sample_adaptive_offset_enabled_flag
+
+    w.push_bit(u8::from(t.pcm));
+    if t.pcm {
+        w.push_bits(7, 4); // pcm_sample_bit_depth_luma_minus1
+        w.push_bits(7, 4); // pcm_sample_bit_depth_chroma_minus1
+        w.push_ue(0); // log2_min_pcm_luma_coding_block_size_minus3
+        w.push_ue(2); // log2_diff_max_min_pcm_luma_coding_block_size
+        w.push_bit(1); // pcm_loop_filter_disabled_flag
+    }
+
+    push_st_ref_pic_sets(w, t.st_ref_pic_sets);
+
+    w.push_bit(u8::from(t.long_term_ref_pics > 0));
+    if t.long_term_ref_pics > 0 {
+        w.push_ue(t.long_term_ref_pics);
+        for _ in 0..t.long_term_ref_pics {
+            // lt_ref_pic_poc_lsb_sps は u(log2_max_pic_order_cnt_lsb_minus4 + 4)。
+            // 値は読み飛ばされるため、ゼロ連続を避けて全ビット 1 にする
+            let bits = TEST_LOG2_MAX_PIC_ORDER_CNT_LSB_MINUS4 + 4;
+            w.push_bits((1u64 << bits) - 1, bits);
+            w.push_bit(1); // used_by_curr_pic_lt_sps_flag
+        }
+    }
+
+    w.push_bit(1); // sps_temporal_mvp_enabled_flag
+    w.push_bit(0); // strong_intra_smoothing_enabled_flag
+
+    match &t.vui {
+        None => w.push_bit(0), // vui_parameters_present_flag
+        Some(vui) => {
+            w.push_bit(1);
+            push_vui_parameters(w, p, vui);
+        }
+    }
+}
+
+/// `scaling_list_data` (7.3.4) を書き込む
+///
+/// 全ての行列で `scaling_list_pred_mode_flag = 1` とし、係数を `se(v) = 0`
+/// (1 ビットの `1`) で埋めて、係数読み飛ばしの個数計算を検証する。
+fn push_scaling_list_data(w: &mut BitWriter) {
+    for size_id in 0..4u32 {
+        let mut matrix_id = 0u32;
+        while matrix_id < 6 {
+            w.push_bit(1); // scaling_list_pred_mode_flag
+            let coef_num = core::cmp::min(64u32, 1u32 << (4 + (size_id << 1)));
+            if size_id > 1 {
+                w.push_ue(0); // scaling_list_dc_coef_minus8 (se(v) = 0)
+            }
+            for _ in 0..coef_num {
+                w.push_ue(0); // scaling_list_delta_coef (se(v) = 0)
+            }
+            matrix_id += if size_id == 3 { 3 } else { 1 };
+        }
+    }
+}
+
+/// `num_short_term_ref_pic_sets` と `st_ref_pic_set` 群 (7.3.7) を書き込む
+///
+/// [`StRefPicSets::Predicted`] は 7.4.8 の導出を通さないと後続の集合の
+/// フラグ個数が決まらない構成にしてある。1 個目は負 2 個 (`DeltaPocS0` が
+/// -1 / -2) と正 1 個 (`DeltaPocS1` が +1) で `NumDeltaPocs = 3`。
+/// 2 個目は `deltaRps = -1` で `use_delta_flag[0] = 0` とするため、
+/// 導出結果は `DeltaPocS0` が -1 / -3 の 2 個・`DeltaPocS1` が 0 個となり
+/// `NumDeltaPocs = 2` に減る。よって 3 個目のフラグは 3 組になる。
+fn push_st_ref_pic_sets(w: &mut BitWriter, kind: StRefPicSets) {
+    match kind {
+        StRefPicSets::None => w.push_ue(0),
+        StRefPicSets::Single => {
+            w.push_ue(1);
+            push_explicit_st_ref_pic_set(w);
+        }
+        StRefPicSets::Predicted => {
+            w.push_ue(3);
+            push_explicit_st_ref_pic_set(w);
+
+            // 2 個目: 参照は 1 個目 (NumDeltaPocs = 3) なのでフラグは 4 組
+            w.push_bit(1); // inter_ref_pic_set_prediction_flag
+            w.push_bit(1); // delta_rps_sign (負)
+            w.push_ue(0); // abs_delta_rps_minus1 → deltaRps = -1
+            w.push_bit(0); // used_by_curr_pic_flag[0]
+            w.push_bit(0); // use_delta_flag[0] (この 1 個が導出から落ちる)
+            w.push_bit(1); // used_by_curr_pic_flag[1]
+            w.push_bit(1); // used_by_curr_pic_flag[2]
+            w.push_bit(1); // used_by_curr_pic_flag[3]
+
+            // 3 個目: 参照は 2 個目 (NumDeltaPocs = 2) なのでフラグは 3 組
+            w.push_bit(1); // inter_ref_pic_set_prediction_flag
+            w.push_bit(1); // delta_rps_sign (負)
+            w.push_ue(0); // abs_delta_rps_minus1 → deltaRps = -1
+            w.push_bit(1); // used_by_curr_pic_flag[0]
+            w.push_bit(1); // used_by_curr_pic_flag[1]
+            w.push_bit(1); // used_by_curr_pic_flag[2]
+        }
+    }
+}
+
+/// `inter_ref_pic_set_prediction_flag == 0` の `st_ref_pic_set` を 1 個書き込む
+///
+/// 負 2 個 (`DeltaPocS0` が -1 / -2) と正 1 個 (`DeltaPocS1` が +1) で
+/// `NumDeltaPocs = 3` になる。
+fn push_explicit_st_ref_pic_set(w: &mut BitWriter) {
+    w.push_ue(2); // num_negative_pics
+    w.push_ue(1); // num_positive_pics
+    w.push_ue(0); // delta_poc_s0_minus1[0] → DeltaPocS0[0] = -1
+    w.push_bit(1); // used_by_curr_pic_s0_flag[0]
+    w.push_ue(0); // delta_poc_s0_minus1[1] → DeltaPocS0[1] = -2
+    w.push_bit(1); // used_by_curr_pic_s0_flag[1]
+    w.push_ue(0); // delta_poc_s1_minus1[0] → DeltaPocS1[0] = +1
+    w.push_bit(1); // used_by_curr_pic_s1_flag[0]
+}
+
+/// `vui_parameters` (E.2.1) を書き込む
+fn push_vui_parameters(w: &mut BitWriter, p: &SpsParams, vui: &VuiParams) {
+    w.push_bit(0); // aspect_ratio_info_present_flag
+    w.push_bit(0); // overscan_info_present_flag
+    w.push_bit(0); // video_signal_type_present_flag
+    w.push_bit(0); // chroma_loc_info_present_flag
+    // 次の 3 つは値が読み飛ばされるだけなので、ゼロ連続を避けて 1 を書く
+    w.push_bit(1); // neutral_chroma_indication_flag
+    w.push_bit(1); // field_seq_flag
+    w.push_bit(1); // frame_field_info_present_flag
+    w.push_bit(0); // default_display_window_flag
+
+    match vui.timing {
+        None => w.push_bit(0), // vui_timing_info_present_flag
+        Some((num_units_in_tick, time_scale)) => {
+            w.push_bit(1);
+            w.push_bits(u64::from(num_units_in_tick), 32);
+            w.push_bits(u64::from(time_scale), 32);
+            w.push_bit(0); // vui_poc_proportional_to_timing_flag
+            w.push_bit(u8::from(vui.hrd)); // vui_hrd_parameters_present_flag
+            if vui.hrd {
+                push_hrd_parameters(w, p.sps_max_sub_layers_minus1, vui.sub_pic_hrd);
+            }
+        }
+    }
+
+    match vui.min_spatial_segmentation_idc {
+        None => w.push_bit(0), // bitstream_restriction_flag
+        Some(value) => {
+            w.push_bit(1);
+            w.push_bit(0); // tiles_fixed_structure_flag
+            w.push_bit(1); // motion_vectors_over_pic_boundaries_flag
+            w.push_bit(0); // restricted_ref_pic_lists_flag
+            w.push_ue(value); // min_spatial_segmentation_idc
+            // 以降はパーサーが読まないが、実ストリームと同じく書いておく
+            w.push_ue(0); // max_bytes_per_pic_denom
+            w.push_ue(0); // max_bits_per_min_cu_denom
+            w.push_ue(15); // log2_max_mv_length_horizontal
+            w.push_ue(15); // log2_max_mv_length_vertical
+        }
+    }
+}
+
+/// `hrd_parameters(1, maxNumSubLayersMinus1)` (E.2.2) を書き込む
+fn push_hrd_parameters(w: &mut BitWriter, max_num_sub_layers_minus1: u8, sub_pic_hrd: bool) {
+    w.push_bit(1); // nal_hrd_parameters_present_flag
+    w.push_bit(1); // vcl_hrd_parameters_present_flag
+    w.push_bit(u8::from(sub_pic_hrd)); // sub_pic_hrd_params_present_flag
+    if sub_pic_hrd {
+        w.push_bits(0xFF, 8); // tick_divisor_minus2
+        w.push_bits(0x1F, 5); // du_cpb_removal_delay_increment_length_minus1
+        w.push_bit(1); // sub_pic_cpb_params_in_pic_timing_sei_flag
+        w.push_bits(0x1F, 5); // dpb_output_delay_du_length_minus1
+    }
+    w.push_bits(0x0F, 4); // bit_rate_scale
+    w.push_bits(0x0F, 4); // cpb_size_scale
+    if sub_pic_hrd {
+        w.push_bits(0x0F, 4); // cpb_size_du_scale
+    }
+    w.push_bits(0x1F, 5); // initial_cpb_removal_delay_length_minus1
+    w.push_bits(0x1F, 5); // au_cpb_removal_delay_length_minus1
+    w.push_bits(0x1F, 5); // dpb_output_delay_length_minus1
+
+    for i in 0..=max_num_sub_layers_minus1 {
+        // 先頭の sub-layer だけ fixed_pic_rate_general_flag = 1 とし、
+        // 残りは low_delay_hrd_flag 経路を通す
+        let fixed_pic_rate_general = i == 0;
+        w.push_bit(u8::from(fixed_pic_rate_general));
+        if fixed_pic_rate_general {
+            // fixed_pic_rate_within_cvs_flag は 1 と推論される
+            w.push_ue(0); // elemental_duration_in_tc_minus1
+            w.push_ue(1); // cpb_cnt_minus1
+            push_sub_layer_hrd_parameters(w, 1, sub_pic_hrd); // nal
+            push_sub_layer_hrd_parameters(w, 1, sub_pic_hrd); // vcl
+        } else {
+            w.push_bit(0); // fixed_pic_rate_within_cvs_flag
+            w.push_bit(1); // low_delay_hrd_flag → cpb_cnt_minus1 は 0 と推論される
+            push_sub_layer_hrd_parameters(w, 0, sub_pic_hrd); // nal
+            push_sub_layer_hrd_parameters(w, 0, sub_pic_hrd); // vcl
+        }
+    }
+}
+
+/// `sub_layer_hrd_parameters(i)` (E.2.3) を書き込む
+fn push_sub_layer_hrd_parameters(w: &mut BitWriter, cpb_cnt_minus1: u32, sub_pic_hrd: bool) {
+    for _ in 0..=cpb_cnt_minus1 {
+        w.push_ue(1); // bit_rate_value_minus1
+        w.push_ue(1); // cpb_size_value_minus1
+        if sub_pic_hrd {
+            w.push_ue(1); // cpb_size_du_value_minus1
+            w.push_ue(1); // bit_rate_du_value_minus1
+        }
+        w.push_bit(1); // cbr_flag
+    }
 }
 
 /// 3 バイト開始コードで NAL を連結した Annex B バイト列を作る
@@ -1693,4 +2031,295 @@ fn real_h265_build_hvc1_box_from_annexb() {
     for array in &hvc1.hvcc_box.nalu_arrays {
         assert_eq!(array.array_completeness.get(), 1);
     }
+}
+
+/// 実 SPS の VUI から timing 情報を読める
+///
+/// 合成ビルダーとパーサーが同じ解釈の誤りを共有していると合成テストは
+/// 通ってしまうため、実データで固定する。25 fps (1 / 25) のストリーム
+#[test]
+fn real_h265_parse_sps_vui_timing_info() {
+    let nals = parse_annexb_nal_units(REAL_H265_VPS_SPS_PPS_ANNEXB)
+        .expect("実 VPS / SPS / PPS の Annex B は解析成功する");
+    let sps = parse_sps(nals[1].data).expect("実 SPS は解析成功する");
+
+    let timing = sps
+        .vui_timing_info
+        .expect("実 SPS は vui_timing_info_present_flag = 1 である");
+    assert_eq!(timing.num_units_in_tick.get(), 1);
+    assert_eq!(timing.time_scale.get(), 25);
+    // この SPS の VUI は bitstream_restriction_flag = 0
+    assert_eq!(sps.min_spatial_segmentation_idc, None);
+}
+
+// ===== parse_sps: VUI =====
+
+/// VUI の timing 情報を読める
+#[test]
+fn parse_sps_reads_vui_timing_info() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams::with_vui(VuiParams {
+            timing: Some((1001, 60000)),
+            ..VuiParams::empty()
+        }),
+    );
+    let sps = parse_sps(&nal).expect("VUI 付き SPS は解析成功する");
+
+    let timing = sps.vui_timing_info.expect("timing 情報が読めること");
+    assert_eq!(timing.num_units_in_tick.get(), 1001);
+    assert_eq!(timing.time_scale.get(), 60000);
+    // 寸法は末尾の有無に影響されない
+    assert_eq!(sps.width, 320);
+    assert_eq!(sps.height, 240);
+}
+
+/// `vui_parameters_present_flag = 0` なら timing 情報は無い
+#[test]
+fn parse_sps_without_vui_has_no_timing_info() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams {
+            vui: None,
+            ..SpsTailParams::with_vui(VuiParams::empty())
+        },
+    );
+    let sps = parse_sps(&nal).expect("VUI なし SPS は解析成功する");
+
+    assert_eq!(sps.vui_timing_info, None);
+    assert_eq!(sps.min_spatial_segmentation_idc, None);
+}
+
+/// `vui_timing_info_present_flag = 0` なら timing 情報は無い
+#[test]
+fn parse_sps_without_timing_info_flag_has_no_timing_info() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams::with_vui(VuiParams::empty()),
+    );
+    let sps = parse_sps(&nal).expect("timing なし VUI の SPS は解析成功する");
+
+    assert_eq!(sps.vui_timing_info, None);
+}
+
+/// VUI より手前で終わる SPS も解析成功し、VUI 由来の値は None になる
+#[test]
+fn parse_sps_truncated_before_vui_has_no_vui_fields() {
+    // build_sps は bit_depth_chroma_minus8 で打ち切る
+    let sps = parse_sps(&build_sps(&SpsParams::valid())).expect("末尾欠落 SPS は解析成功する");
+
+    assert_eq!(sps.vui_timing_info, None);
+    assert_eq!(sps.min_spatial_segmentation_idc, None);
+    assert_eq!(sps.width, 320);
+}
+
+/// `vui_time_scale = 0` の SPS は末尾の解析失敗として扱い、VUI 由来の値を落とす
+///
+/// E.2.1 は 0 より大きいことを要求する。0 を既定値で補完しない
+#[test]
+fn parse_sps_zero_time_scale_drops_vui_fields() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams::with_vui(VuiParams {
+            timing: Some((1000, 0)),
+            min_spatial_segmentation_idc: Some(15),
+            ..VuiParams::empty()
+        }),
+    );
+    let sps = parse_sps(&nal).expect("不正 timing でも SPS 全体は解析成功する");
+
+    assert_eq!(sps.vui_timing_info, None);
+    assert_eq!(sps.min_spatial_segmentation_idc, None);
+    // 寸法と profile 系は影響を受けない
+    assert_eq!(sps.width, 320);
+    assert_eq!(sps.general_level_idc, 90);
+}
+
+/// `bitstream_restriction_flag` の `min_spatial_segmentation_idc` を読める
+#[test]
+fn parse_sps_reads_min_spatial_segmentation_idc() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams::with_vui(VuiParams {
+            timing: Some((1, 30)),
+            min_spatial_segmentation_idc: Some(15),
+            ..VuiParams::empty()
+        }),
+    );
+    let sps = parse_sps(&nal).expect("bitstream restriction 付き SPS は解析成功する");
+
+    assert_eq!(sps.min_spatial_segmentation_idc, Some(15));
+}
+
+/// `min_spatial_segmentation_idc` が値域外 (4096 以上) なら VUI 由来の値を落とす
+#[test]
+fn parse_sps_min_spatial_segmentation_idc_out_of_range_drops_vui_fields() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams::with_vui(VuiParams {
+            timing: Some((1, 30)),
+            min_spatial_segmentation_idc: Some(4096),
+            ..VuiParams::empty()
+        }),
+    );
+    let sps = parse_sps(&nal).expect("値域外でも SPS 全体は解析成功する");
+
+    assert_eq!(sps.min_spatial_segmentation_idc, None);
+    // timing は同じ末尾の解析で落ちる (部分的な採用はしない)
+    assert_eq!(sps.vui_timing_info, None);
+}
+
+/// `hrd_parameters` を跨いで bitstream restriction を読める
+#[test]
+fn parse_sps_skips_hrd_parameters() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams::with_vui(VuiParams {
+            timing: Some((1, 30)),
+            hrd: true,
+            sub_pic_hrd: false,
+            min_spatial_segmentation_idc: Some(7),
+        }),
+    );
+    let sps = parse_sps(&nal).expect("hrd 付き SPS は解析成功する");
+
+    assert_eq!(sps.vui_timing_info.expect("timing").time_scale.get(), 30);
+    assert_eq!(sps.min_spatial_segmentation_idc, Some(7));
+}
+
+/// `sub_pic_hrd_params_present_flag = 1` の `hrd_parameters` も跨げる
+#[test]
+fn parse_sps_skips_sub_pic_hrd_parameters() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams::with_vui(VuiParams {
+            timing: Some((1, 30)),
+            hrd: true,
+            sub_pic_hrd: true,
+            min_spatial_segmentation_idc: Some(7),
+        }),
+    );
+    let sps = parse_sps(&nal).expect("sub-pic hrd 付き SPS は解析成功する");
+
+    assert_eq!(sps.min_spatial_segmentation_idc, Some(7));
+}
+
+/// sub-layer が複数ある `hrd_parameters` も跨げる
+#[test]
+fn parse_sps_skips_hrd_parameters_with_sub_layers() {
+    let nal = build_sps_with_tail(
+        &SpsParams {
+            sps_max_sub_layers_minus1: 2,
+            ..SpsParams::valid()
+        },
+        &SpsTailParams {
+            sub_layer_ordering_info_present: true,
+            ..SpsTailParams::with_vui(VuiParams {
+                timing: Some((1, 30)),
+                hrd: true,
+                sub_pic_hrd: false,
+                min_spatial_segmentation_idc: Some(3),
+            })
+        },
+    );
+    let sps = parse_sps(&nal).expect("sub-layer 付き SPS は解析成功する");
+
+    assert_eq!(sps.sps_max_sub_layers_minus1, 2);
+    assert_eq!(sps.min_spatial_segmentation_idc, Some(3));
+}
+
+/// `scaling_list_data` と `pcm` の構文を跨いで VUI を読める
+#[test]
+fn parse_sps_skips_scaling_list_and_pcm() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams {
+            scaling_list: true,
+            pcm: true,
+            ..SpsTailParams::with_vui(VuiParams {
+                timing: Some((1, 50)),
+                min_spatial_segmentation_idc: Some(1),
+                ..VuiParams::empty()
+            })
+        },
+    );
+    let sps = parse_sps(&nal).expect("scaling list / pcm 付き SPS は解析成功する");
+
+    assert_eq!(sps.vui_timing_info.expect("timing").time_scale.get(), 50);
+    assert_eq!(sps.min_spatial_segmentation_idc, Some(1));
+}
+
+/// 明示的な `st_ref_pic_set` と long-term 参照を跨いで VUI を読める
+#[test]
+fn parse_sps_skips_explicit_st_ref_pic_set_and_long_term() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams {
+            st_ref_pic_sets: StRefPicSets::Single,
+            long_term_ref_pics: 2,
+            ..SpsTailParams::with_vui(VuiParams {
+                timing: Some((1, 60)),
+                ..VuiParams::empty()
+            })
+        },
+    );
+    let sps = parse_sps(&nal).expect("st_ref_pic_set 付き SPS は解析成功する");
+
+    assert_eq!(sps.vui_timing_info.expect("timing").time_scale.get(), 60);
+}
+
+/// `inter_ref_pic_set_prediction_flag = 1` の `st_ref_pic_set` を跨いで VUI を読める
+///
+/// 予測された集合の `NumDeltaPocs` を 7.4.8 のとおり導出しないと、後続の集合の
+/// フラグ個数がずれて VUI の読み出し位置が壊れる
+#[test]
+fn parse_sps_skips_predicted_st_ref_pic_sets() {
+    let nal = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams {
+            st_ref_pic_sets: StRefPicSets::Predicted,
+            ..SpsTailParams::with_vui(VuiParams {
+                timing: Some((1001, 24000)),
+                min_spatial_segmentation_idc: Some(4095),
+                ..VuiParams::empty()
+            })
+        },
+    );
+    let sps = parse_sps(&nal).expect("予測 st_ref_pic_set 付き SPS は解析成功する");
+
+    let timing = sps.vui_timing_info.expect("timing");
+    assert_eq!(timing.num_units_in_tick.get(), 1001);
+    assert_eq!(timing.time_scale.get(), 24000);
+    assert_eq!(sps.min_spatial_segmentation_idc, Some(4095));
+}
+
+/// hvcC の min_spatial_segmentation_idc に SPS の VUI の値が載る
+#[test]
+fn build_hev1_box_uses_min_spatial_segmentation_idc_from_sps() {
+    let sps = build_sps_with_tail(
+        &SpsParams::valid(),
+        &SpsTailParams::with_vui(VuiParams {
+            timing: Some((1, 30)),
+            min_spatial_segmentation_idc: Some(9),
+            ..VuiParams::empty()
+        }),
+    );
+    let hev1 = build_hev1_box(&[valid_vps()], &[sps], &[valid_pps()], &default_config())
+        .expect("VUI 付き SPS から構築成功する");
+
+    assert_eq!(hev1.hvcc_box.min_spatial_segmentation_idc.get(), 9);
+}
+
+/// VUI に bitstream restriction が無ければ hvcC の min_spatial_segmentation_idc は 0
+#[test]
+fn build_hev1_box_min_spatial_segmentation_idc_defaults_to_zero() {
+    let hev1 = build_hev1_box(
+        &[valid_vps()],
+        &[build_sps(&SpsParams::valid())],
+        &[valid_pps()],
+        &default_config(),
+    )
+    .expect("末尾欠落 SPS から構築成功する");
+
+    assert_eq!(hev1.hvcc_box.min_spatial_segmentation_idc.get(), 0);
 }

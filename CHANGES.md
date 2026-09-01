@@ -11,6 +11,11 @@
 
 ## develop
 
+- [ADD] `bitstream::h265::parse_sps` が SPS の VUI から timing 情報と `min_spatial_segmentation_idc` を読む
+  - `H265Sps` に `vui_timing_info` (`H265VuiTimingInfo`) と `min_spatial_segmentation_idc` を追加する
+  - VUI に到達するため `st_ref_pic_set` の `NumDeltaPocs` 導出 (7.4.8) を含む SPS 末尾の構文を読み進める
+  - 末尾の解析に失敗した SPS は寸法と profile 系の欄が確定しているため、該当フィールドを `None` として解析成功とする
+  - `build_hev1_box` / `build_hvc1_box` の `hvcC` の `min_spatial_segmentation_idc` は 0 固定をやめ、先頭 SPS の VUI の値を写す
 - [ADD] MPEG-4 Visual の `Mp4vBox` と `SampleEntry::Mp4v` を追加する
   - `codec_string::from_sample_entry` は OTI が `0x20` のときのみ VisualObjectSequence から profile_and_level_indication を読む
 

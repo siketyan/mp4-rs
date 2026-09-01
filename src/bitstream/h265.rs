@@ -27,6 +27,7 @@
 pub use crate::bitstream::nal::LengthSize;
 
 use alloc::{vec, vec::Vec};
+use core::num::NonZeroU32;
 
 use crate::{
     Error, Result, Uint,
@@ -352,6 +353,18 @@ pub struct H265Sps {
     /// `VisualSampleEntryFields::height` に写せるよう `u16` に収まらない値は
     /// [`parse_sps`] が拒否する
     pub height: u16,
+
+    /// VUI の timing 情報 (ITU-T H.265 E.2.1)
+    ///
+    /// `vui_parameters_present_flag == 0`、`vui_timing_info_present_flag == 0`、
+    /// または SPS が VUI の手前で終わっている場合は `None`
+    pub vui_timing_info: Option<H265VuiTimingInfo>,
+
+    /// VUI の `min_spatial_segmentation_idc` (0..=4095)
+    ///
+    /// `bitstream_restriction_flag == 0`、または SPS がそこまで届いていない
+    /// 場合は `None`。ISO/IEC 14496-15:2022 8.3.2.1.3 の同名欄に写せる
+    pub min_spatial_segmentation_idc: Option<u16>,
 }
 
 /// NAL ヘッダー付き EBSP の SPS を解析する
@@ -378,16 +391,25 @@ pub struct H265Sps {
 ///   (7.4.3.2.1 は 1 と定める)
 /// - 寸法の導出に必要な構文 (bit depth まで) が途中で終わる SPS、
 ///   Exp-Golomb の途中終端。`log2_max_pic_order_cnt_lsb_minus4` 以降の欠落は
-///   成功とする
+///   成功とし、VUI 由来のフィールドを `None` にする
 /// - クロップが符号化サイズ以上 (7.4.3.2.1 は未満を要求)
 /// - クロップ後の幅または高さが 0
 /// - クロップ後の幅または高さが `u16::MAX` を超える
 ///
+/// # VUI
+///
+/// `log2_max_pic_order_cnt_lsb_minus4` 以降は VUI に到達するためだけに読み進め、
+/// VUI からは timing 情報 (`vui_num_units_in_tick` / `vui_time_scale`) と
+/// `min_spatial_segmentation_idc` の 2 つだけを [`H265Sps`] に載せる。
+/// この末尾部分の解析に失敗した SPS (途中終端、値域外) は、寸法と profile 系の
+/// 欄が既に確定しているため [`parse_sps`] 全体の失敗にはせず、該当フィールドを
+/// `None` として成功させる。
+///
 /// # 対象外
 ///
-/// VUI と `log2_max_pic_order_cnt_lsb_minus4` 以降は読まない。sub-layer の
-/// profile / level はビット位置を進めるためだけに読み飛ばし、公開結果には
-/// 載せない。
+/// VUI の timing と `min_spatial_segmentation_idc` 以外の構文要素、および
+/// sub-layer の profile / level はビット位置を進めるためだけに読み飛ばし、
+/// 公開結果には載せない。
 pub fn parse_sps(nal_unit: &[u8]) -> Result<H265Sps> {
     let nal_unit_type = validate_h265_nal_header(nal_unit)?;
     if nal_unit_type != H265NalUnitType::Sps {
@@ -543,6 +565,11 @@ pub fn parse_sps(nal_unit: &[u8]) -> Result<H265Sps> {
     let height = u16::try_from(cropped_height)
         .map_err(|_| Error::invalid_input("frame height exceeds u16::MAX"))?;
 
+    // bit depth より後ろは寸法と hvcC の profile 系の欄に不要なので、読めた
+    // ぶんだけを採る。途中終端や範囲外の値に当たったら情報なしとして扱う
+    // (7.4.3.2.1 の末尾まで読み切れない SPS も解析成功とする既存の契約を保つ)
+    let tail = parse_sps_tail(&mut reader, sps_max_sub_layers_minus1).unwrap_or_default();
+
     Ok(H265Sps {
         general_profile_space,
         general_tier_flag,
@@ -557,7 +584,501 @@ pub fn parse_sps(nal_unit: &[u8]) -> Result<H265Sps> {
         bit_depth_chroma_minus8: bit_depth_chroma_minus8 as u8,
         width,
         height,
+        vui_timing_info: tail.vui_timing_info,
+        min_spatial_segmentation_idc: tail.min_spatial_segmentation_idc,
     })
+}
+
+/// SPS の VUI (ITU-T H.265 E.2.1 `vui_parameters`) の timing 情報
+///
+/// `vui_timing_info_present_flag == 1` のときだけ存在する。フレーム間隔は
+/// `num_units_in_tick / time_scale` 秒で、E.2.1 はどちらも 0 より大きいことを
+/// 要求するため [`NonZeroU32`] で持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct H265VuiTimingInfo {
+    /// `vui_num_units_in_tick`
+    pub num_units_in_tick: NonZeroU32,
+
+    /// `vui_time_scale`
+    pub time_scale: NonZeroU32,
+}
+
+/// `bit_depth_chroma_minus8` より後ろの SPS 構文から取り出す値
+///
+/// 全て「無ければ `None`」であり、既定値で埋めない。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+struct SpsTail {
+    vui_timing_info: Option<H265VuiTimingInfo>,
+    min_spatial_segmentation_idc: Option<u16>,
+}
+
+/// 1 個の `st_ref_pic_set` (ITU-T H.265 7.3.7) の導出結果
+///
+/// 後続の集合が `inter_ref_pic_set_prediction_flag == 1` で参照するため、
+/// 読み飛ばすだけでは足りず `NumDeltaPocs` の導出に必要な値を保持する。
+#[derive(Debug, Clone, Default)]
+struct StRefPicSet {
+    /// `DeltaPocS0` (負方向。7.4.8)
+    delta_poc_s0: Vec<i64>,
+    /// `UsedByCurrPicS0`
+    used_by_curr_pic_s0: Vec<bool>,
+    /// `DeltaPocS1` (正方向。7.4.8)
+    delta_poc_s1: Vec<i64>,
+    /// `UsedByCurrPicS1`
+    used_by_curr_pic_s1: Vec<bool>,
+}
+
+impl StRefPicSet {
+    /// `NumDeltaPocs[stRpsIdx]` (7-71)
+    fn num_delta_pocs(&self) -> usize {
+        self.delta_poc_s0.len() + self.delta_poc_s1.len()
+    }
+}
+
+/// `num_short_term_ref_pic_sets` の上限 (ITU-T H.265 7.4.3.2.1 は 0..=64)
+const MAX_SHORT_TERM_REF_PIC_SETS: u32 = 64;
+
+/// 1 個の `st_ref_pic_set` に載る負方向 / 正方向それぞれの上限
+///
+/// 7.4.8 は `num_negative_pics` を
+/// `sps_max_dec_pic_buffering_minus1[sps_max_sub_layers_minus1]` 以下と定め、
+/// A.4.2 の `MaxDpbSize` は 16 なので 16 を上限とする
+const MAX_REF_PICS_PER_SET: u32 = 16;
+
+/// `num_long_term_ref_pics_sps` の上限 (ITU-T H.265 7.4.3.2.1 は 0..=32)
+const MAX_LONG_TERM_REF_PICS_SPS: u32 = 32;
+
+/// `log2_max_pic_order_cnt_lsb_minus4` の上限 (ITU-T H.265 7.4.3.2.1 は 0..=12)
+const MAX_LOG2_MAX_PIC_ORDER_CNT_LSB_MINUS4: u32 = 12;
+
+/// `cpb_cnt_minus1` の上限 (ITU-T H.265 E.3.2 は 0..=31)
+const MAX_CPB_CNT_MINUS1: u32 = 31;
+
+/// `min_spatial_segmentation_idc` の上限
+///
+/// ITU-T H.265 E.3.1 は 0..=4095 と定め、ISO/IEC 14496-15:2022 8.3.2.1.3 の
+/// `min_spatial_segmentation_idc` も 12 ビット欄である
+const MAX_MIN_SPATIAL_SEGMENTATION_IDC: u32 = 4095;
+
+/// `bit_depth_chroma_minus8` の続きから SPS 末尾の構文を読む
+///
+/// 寸法と `hvcC` の profile 系の欄は既に確定しているため、この関数の失敗は
+/// [`parse_sps`] 全体の失敗にはせず「情報なし」として扱う (呼び出し側で
+/// [`SpsTail::default`] に落とす)。読む順序は ITU-T H.265 7.3.2.2.1 に従い、
+/// VUI 以外の構文要素は位置を進めるためだけに読む。
+fn parse_sps_tail(reader: &mut SpsBitReader, sps_max_sub_layers_minus1: u8) -> Result<SpsTail> {
+    let log2_max_pic_order_cnt_lsb_minus4 = reader.read_ue()?;
+    if log2_max_pic_order_cnt_lsb_minus4 > MAX_LOG2_MAX_PIC_ORDER_CNT_LSB_MINUS4 {
+        return Err(Error::invalid_input(
+            "log2_max_pic_order_cnt_lsb_minus4 must be 0..=12",
+        ));
+    }
+
+    // sps_sub_layer_ordering_info_present_flag == 0 のときは最上位の sub-layer
+    // ぶんだけが書かれる (7.3.2.2.1)
+    let sub_layer_ordering_info_present = reader.read_bit()? != 0;
+    let first_sub_layer = if sub_layer_ordering_info_present {
+        0
+    } else {
+        sps_max_sub_layers_minus1
+    };
+    for _ in first_sub_layer..=sps_max_sub_layers_minus1 {
+        reader.read_ue()?; // sps_max_dec_pic_buffering_minus1
+        reader.read_ue()?; // sps_max_num_reorder_pics
+        reader.read_ue()?; // sps_max_latency_increase_plus1
+    }
+
+    reader.read_ue()?; // log2_min_luma_coding_block_size_minus3
+    reader.read_ue()?; // log2_diff_max_min_luma_coding_block_size
+    reader.read_ue()?; // log2_min_luma_transform_block_size_minus2
+    reader.read_ue()?; // log2_diff_max_min_luma_transform_block_size
+    reader.read_ue()?; // max_transform_hierarchy_depth_inter
+    reader.read_ue()?; // max_transform_hierarchy_depth_intra
+
+    if reader.read_bit()? != 0 {
+        // scaling_list_enabled_flag == 1
+        if reader.read_bit()? != 0 {
+            // sps_scaling_list_data_present_flag == 1
+            skip_scaling_list_data(reader)?;
+        }
+    }
+
+    reader.read_bit()?; // amp_enabled_flag
+    reader.read_bit()?; // sample_adaptive_offset_enabled_flag
+
+    if reader.read_bit()? != 0 {
+        // pcm_enabled_flag == 1
+        reader.skip_bits(4)?; // pcm_sample_bit_depth_luma_minus1
+        reader.skip_bits(4)?; // pcm_sample_bit_depth_chroma_minus1
+        reader.read_ue()?; // log2_min_pcm_luma_coding_block_size_minus3
+        reader.read_ue()?; // log2_diff_max_min_pcm_luma_coding_block_size
+        reader.read_bit()?; // pcm_loop_filter_disabled_flag
+    }
+
+    skip_short_term_ref_pic_sets(reader)?;
+
+    if reader.read_bit()? != 0 {
+        // long_term_ref_pics_present_flag == 1
+        let num_long_term_ref_pics_sps = reader.read_ue()?;
+        if num_long_term_ref_pics_sps > MAX_LONG_TERM_REF_PICS_SPS {
+            return Err(Error::invalid_input(
+                "num_long_term_ref_pics_sps must be 0..=32",
+            ));
+        }
+        for _ in 0..num_long_term_ref_pics_sps {
+            // lt_ref_pic_poc_lsb_sps は u(log2_max_pic_order_cnt_lsb_minus4 + 4)
+            reader.skip_bits(log2_max_pic_order_cnt_lsb_minus4 + 4)?;
+            reader.read_bit()?; // used_by_curr_pic_lt_sps_flag
+        }
+    }
+
+    reader.read_bit()?; // sps_temporal_mvp_enabled_flag
+    reader.read_bit()?; // strong_intra_smoothing_enabled_flag
+
+    if reader.read_bit()? == 0 {
+        // vui_parameters_present_flag == 0
+        return Ok(SpsTail::default());
+    }
+
+    parse_vui_parameters(reader, sps_max_sub_layers_minus1)
+}
+
+/// `scaling_list_data` (ITU-T H.265 7.3.4) を読み飛ばす
+///
+/// `se(v)` は `ue(v)` と同じビット列長 (符号は codeNum の写像で決まる) なので、
+/// 値を捨てる読み飛ばしには `read_ue` を使う。
+fn skip_scaling_list_data(reader: &mut SpsBitReader) -> Result<()> {
+    for size_id in 0..4u32 {
+        let mut matrix_id = 0u32;
+        while matrix_id < 6 {
+            if reader.read_bit()? == 0 {
+                // scaling_list_pred_mode_flag == 0
+                reader.read_ue()?; // scaling_list_pred_matrix_id_delta
+            } else {
+                // coefNum = Min(64, 1 << (4 + (sizeId << 1)))
+                let coef_num = core::cmp::min(64u32, 1u32 << (4 + (size_id << 1)));
+                if size_id > 1 {
+                    reader.read_ue()?; // scaling_list_dc_coef_minus8 (se(v))
+                }
+                for _ in 0..coef_num {
+                    reader.read_ue()?; // scaling_list_delta_coef (se(v))
+                }
+            }
+            // sizeId == 3 のときだけ matrixId は 0 と 3 の 2 個 (7.3.4)
+            matrix_id += if size_id == 3 { 3 } else { 1 };
+        }
+    }
+    Ok(())
+}
+
+/// SPS 内の `st_ref_pic_set` 群 (ITU-T H.265 7.3.7) を読み飛ばす
+///
+/// 後続の集合が直前の集合を参照して構文長を決めるため、`NumDeltaPocs` を
+/// 導出しながら順に読む。
+fn skip_short_term_ref_pic_sets(reader: &mut SpsBitReader) -> Result<()> {
+    let num_short_term_ref_pic_sets = reader.read_ue()?;
+    if num_short_term_ref_pic_sets > MAX_SHORT_TERM_REF_PIC_SETS {
+        return Err(Error::invalid_input(
+            "num_short_term_ref_pic_sets must be 0..=64",
+        ));
+    }
+
+    let mut sets: Vec<StRefPicSet> = Vec::new();
+    for index in 0..num_short_term_ref_pic_sets as usize {
+        let set = parse_st_ref_pic_set(reader, index, &sets)?;
+        sets.push(set);
+    }
+    Ok(())
+}
+
+/// `st_ref_pic_set(stRpsIdx)` (ITU-T H.265 7.3.7) を 1 個読み、7.4.8 の
+/// `DeltaPocS0` / `DeltaPocS1` を導出する
+///
+/// SPS 内では `stRpsIdx < num_short_term_ref_pic_sets` が常に成り立つため、
+/// `delta_idx_minus1` は構文上存在せず 0 と推論される。よって参照先
+/// (`RefRpsIdx`) は直前の集合に限られる。
+fn parse_st_ref_pic_set(
+    reader: &mut SpsBitReader,
+    index: usize,
+    previous: &[StRefPicSet],
+) -> Result<StRefPicSet> {
+    // stRpsIdx == 0 では inter_ref_pic_set_prediction_flag が存在せず 0 と推論する
+    let inter_prediction = index != 0 && reader.read_bit()? != 0;
+
+    if !inter_prediction {
+        let num_negative_pics = reader.read_ue()?;
+        let num_positive_pics = reader.read_ue()?;
+        if num_negative_pics > MAX_REF_PICS_PER_SET || num_positive_pics > MAX_REF_PICS_PER_SET {
+            return Err(Error::invalid_input(
+                "num_negative_pics and num_positive_pics must be 0..=16",
+            ));
+        }
+
+        let mut set = StRefPicSet::default();
+        // DeltaPocS0[i] = DeltaPocS0[i - 1] - (delta_poc_s0_minus1[i] + 1) (7-67)
+        let mut poc: i64 = 0;
+        for _ in 0..num_negative_pics {
+            poc -= i64::from(reader.read_ue()?) + 1;
+            set.delta_poc_s0.push(poc);
+            set.used_by_curr_pic_s0.push(reader.read_bit()? != 0);
+        }
+        // DeltaPocS1[i] = DeltaPocS1[i - 1] + (delta_poc_s1_minus1[i] + 1) (7-69)
+        let mut poc: i64 = 0;
+        for _ in 0..num_positive_pics {
+            poc += i64::from(reader.read_ue()?) + 1;
+            set.delta_poc_s1.push(poc);
+            set.used_by_curr_pic_s1.push(reader.read_bit()? != 0);
+        }
+        return Ok(set);
+    }
+
+    let reference = previous
+        .last()
+        .expect("index != 0 なので直前の st_ref_pic_set が存在する");
+
+    let delta_rps_sign = reader.read_bit()?;
+    let abs_delta_rps_minus1 = reader.read_ue()?;
+    // deltaRps = (1 - 2 * delta_rps_sign) * (abs_delta_rps_minus1 + 1) (7-59)
+    let delta_rps = (1 - 2 * i64::from(delta_rps_sign)) * (i64::from(abs_delta_rps_minus1) + 1);
+
+    let num_negative = reference.delta_poc_s0.len();
+    let num_positive = reference.delta_poc_s1.len();
+    let num_delta_pocs = reference.num_delta_pocs();
+
+    let mut used_by_curr_pic = Vec::with_capacity(num_delta_pocs + 1);
+    let mut use_delta = Vec::with_capacity(num_delta_pocs + 1);
+    for _ in 0..=num_delta_pocs {
+        let used = reader.read_bit()? != 0;
+        // used_by_curr_pic_flag[j] == 1 のとき use_delta_flag[j] は 1 と推論する
+        let use_delta_flag = if used { true } else { reader.read_bit()? != 0 };
+        used_by_curr_pic.push(used);
+        use_delta.push(use_delta_flag);
+    }
+
+    let mut set = StRefPicSet::default();
+
+    // DeltaPocS0 の導出 (7-61)
+    for j in (0..num_positive).rev() {
+        let d_poc = reference.delta_poc_s1[j] + delta_rps;
+        if d_poc < 0 && use_delta[num_negative + j] {
+            set.delta_poc_s0.push(d_poc);
+            set.used_by_curr_pic_s0
+                .push(used_by_curr_pic[num_negative + j]);
+        }
+    }
+    if delta_rps < 0 && use_delta[num_delta_pocs] {
+        set.delta_poc_s0.push(delta_rps);
+        set.used_by_curr_pic_s0
+            .push(used_by_curr_pic[num_delta_pocs]);
+    }
+    for j in 0..num_negative {
+        let d_poc = reference.delta_poc_s0[j] + delta_rps;
+        if d_poc < 0 && use_delta[j] {
+            set.delta_poc_s0.push(d_poc);
+            set.used_by_curr_pic_s0.push(used_by_curr_pic[j]);
+        }
+    }
+
+    // DeltaPocS1 の導出 (7-62)
+    for j in (0..num_negative).rev() {
+        let d_poc = reference.delta_poc_s0[j] + delta_rps;
+        if d_poc > 0 && use_delta[j] {
+            set.delta_poc_s1.push(d_poc);
+            set.used_by_curr_pic_s1.push(used_by_curr_pic[j]);
+        }
+    }
+    if delta_rps > 0 && use_delta[num_delta_pocs] {
+        set.delta_poc_s1.push(delta_rps);
+        set.used_by_curr_pic_s1
+            .push(used_by_curr_pic[num_delta_pocs]);
+    }
+    for j in 0..num_positive {
+        let d_poc = reference.delta_poc_s1[j] + delta_rps;
+        if d_poc > 0 && use_delta[num_negative + j] {
+            set.delta_poc_s1.push(d_poc);
+            set.used_by_curr_pic_s1
+                .push(used_by_curr_pic[num_negative + j]);
+        }
+    }
+
+    Ok(set)
+}
+
+/// `vui_parameters` (ITU-T H.265 E.2.1) から timing と
+/// `min_spatial_segmentation_idc` を取り出す
+///
+/// `bitstream_restriction_flag` の `min_spatial_segmentation_idc` より後ろは
+/// 読まない。
+fn parse_vui_parameters(
+    reader: &mut SpsBitReader,
+    sps_max_sub_layers_minus1: u8,
+) -> Result<SpsTail> {
+    if reader.read_bit()? != 0 {
+        // aspect_ratio_info_present_flag == 1
+        let aspect_ratio_idc = reader.read_bits(8)?;
+        // 255 (EXTENDED_SAR) のときだけ sar_width / sar_height が続く
+        if aspect_ratio_idc == 255 {
+            reader.skip_bits(32)?;
+        }
+    }
+    if reader.read_bit()? != 0 {
+        // overscan_info_present_flag == 1
+        reader.read_bit()?; // overscan_appropriate_flag
+    }
+    if reader.read_bit()? != 0 {
+        // video_signal_type_present_flag == 1
+        reader.skip_bits(3)?; // video_format
+        reader.read_bit()?; // video_full_range_flag
+        if reader.read_bit()? != 0 {
+            // colour_description_present_flag == 1
+            // colour_primaries / transfer_characteristics / matrix_coeffs
+            reader.skip_bits(24)?;
+        }
+    }
+    if reader.read_bit()? != 0 {
+        // chroma_loc_info_present_flag == 1
+        reader.read_ue()?; // chroma_sample_loc_type_top_field
+        reader.read_ue()?; // chroma_sample_loc_type_bottom_field
+    }
+    reader.read_bit()?; // neutral_chroma_indication_flag
+    reader.read_bit()?; // field_seq_flag
+    reader.read_bit()?; // frame_field_info_present_flag
+    if reader.read_bit()? != 0 {
+        // default_display_window_flag == 1
+        reader.read_ue()?; // def_disp_win_left_offset
+        reader.read_ue()?; // def_disp_win_right_offset
+        reader.read_ue()?; // def_disp_win_top_offset
+        reader.read_ue()?; // def_disp_win_bottom_offset
+    }
+
+    let mut vui_timing_info = None;
+    if reader.read_bit()? != 0 {
+        // vui_timing_info_present_flag == 1
+        let num_units_in_tick = reader.read_bits(32)? as u32;
+        let time_scale = reader.read_bits(32)? as u32;
+        let (Some(num_units_in_tick), Some(time_scale)) = (
+            NonZeroU32::new(num_units_in_tick),
+            NonZeroU32::new(time_scale),
+        ) else {
+            // E.2.1 はどちらも 0 より大きいことを要求する。0 を既定値で
+            // 補わず、timing 情報なしにもせず、末尾の解析失敗として扱う
+            return Err(Error::invalid_input(
+                "vui_num_units_in_tick and vui_time_scale must be greater than 0",
+            ));
+        };
+        vui_timing_info = Some(H265VuiTimingInfo {
+            num_units_in_tick,
+            time_scale,
+        });
+
+        if reader.read_bit()? != 0 {
+            // vui_poc_proportional_to_timing_flag == 1
+            reader.read_ue()?; // vui_num_ticks_poc_diff_one_minus1
+        }
+        if reader.read_bit()? != 0 {
+            // vui_hrd_parameters_present_flag == 1
+            skip_hrd_parameters(reader, sps_max_sub_layers_minus1)?;
+        }
+    }
+
+    let mut min_spatial_segmentation_idc = None;
+    if reader.read_bit()? != 0 {
+        // bitstream_restriction_flag == 1
+        reader.read_bit()?; // tiles_fixed_structure_flag
+        reader.read_bit()?; // motion_vectors_over_pic_boundaries_flag
+        reader.read_bit()?; // restricted_ref_pic_lists_flag
+        let value = reader.read_ue()?;
+        if value > MAX_MIN_SPATIAL_SEGMENTATION_IDC {
+            return Err(Error::invalid_input(
+                "min_spatial_segmentation_idc must be 0..=4095",
+            ));
+        }
+        min_spatial_segmentation_idc = Some(value as u16);
+        // max_bytes_per_pic_denom 以降は使わないので読まない
+    }
+
+    Ok(SpsTail {
+        vui_timing_info,
+        min_spatial_segmentation_idc,
+    })
+}
+
+/// `hrd_parameters(1, maxNumSubLayersMinus1)` (ITU-T H.265 E.2.2) を読み飛ばす
+///
+/// VUI から呼ばれるため `commonInfPresentFlag` は常に 1 である。
+fn skip_hrd_parameters(reader: &mut SpsBitReader, max_num_sub_layers_minus1: u8) -> Result<()> {
+    let nal_hrd_parameters_present = reader.read_bit()? != 0;
+    let vcl_hrd_parameters_present = reader.read_bit()? != 0;
+
+    let mut sub_pic_hrd_params_present = false;
+    if nal_hrd_parameters_present || vcl_hrd_parameters_present {
+        sub_pic_hrd_params_present = reader.read_bit()? != 0;
+        if sub_pic_hrd_params_present {
+            reader.skip_bits(8)?; // tick_divisor_minus2
+            reader.skip_bits(5)?; // du_cpb_removal_delay_increment_length_minus1
+            reader.read_bit()?; // sub_pic_cpb_params_in_pic_timing_sei_flag
+            reader.skip_bits(5)?; // dpb_output_delay_du_length_minus1
+        }
+        reader.skip_bits(4)?; // bit_rate_scale
+        reader.skip_bits(4)?; // cpb_size_scale
+        if sub_pic_hrd_params_present {
+            reader.skip_bits(4)?; // cpb_size_du_scale
+        }
+        reader.skip_bits(5)?; // initial_cpb_removal_delay_length_minus1
+        reader.skip_bits(5)?; // au_cpb_removal_delay_length_minus1
+        reader.skip_bits(5)?; // dpb_output_delay_length_minus1
+    }
+
+    for _ in 0..=max_num_sub_layers_minus1 {
+        let fixed_pic_rate_general = reader.read_bit()? != 0;
+        // fixed_pic_rate_general_flag == 1 のとき fixed_pic_rate_within_cvs_flag
+        // は 1 と推論する (E.3.2)
+        let fixed_pic_rate_within_cvs = if fixed_pic_rate_general {
+            true
+        } else {
+            reader.read_bit()? != 0
+        };
+
+        let mut low_delay_hrd = false;
+        if fixed_pic_rate_within_cvs {
+            reader.read_ue()?; // elemental_duration_in_tc_minus1
+        } else {
+            low_delay_hrd = reader.read_bit()? != 0;
+        }
+
+        // low_delay_hrd_flag == 1 のとき cpb_cnt_minus1 は 0 と推論する (E.3.2)
+        let cpb_cnt_minus1 = if low_delay_hrd { 0 } else { reader.read_ue()? };
+        if cpb_cnt_minus1 > MAX_CPB_CNT_MINUS1 {
+            return Err(Error::invalid_input("cpb_cnt_minus1 must be 0..=31"));
+        }
+
+        if nal_hrd_parameters_present {
+            skip_sub_layer_hrd_parameters(reader, cpb_cnt_minus1, sub_pic_hrd_params_present)?;
+        }
+        if vcl_hrd_parameters_present {
+            skip_sub_layer_hrd_parameters(reader, cpb_cnt_minus1, sub_pic_hrd_params_present)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// `sub_layer_hrd_parameters(i)` (ITU-T H.265 E.2.3) を読み飛ばす
+fn skip_sub_layer_hrd_parameters(
+    reader: &mut SpsBitReader,
+    cpb_cnt_minus1: u32,
+    sub_pic_hrd_params_present: bool,
+) -> Result<()> {
+    for _ in 0..=cpb_cnt_minus1 {
+        reader.read_ue()?; // bit_rate_value_minus1
+        reader.read_ue()?; // cpb_size_value_minus1
+        if sub_pic_hrd_params_present {
+            reader.read_ue()?; // cpb_size_du_value_minus1
+            reader.read_ue()?; // bit_rate_du_value_minus1
+        }
+        reader.read_bit()?; // cbr_flag
+    }
+    Ok(())
 }
 
 /// `hvcC` の `constantFrameRate` の状態 (ISO/IEC 14496-15:2022 8.3.2.1.3)
@@ -628,12 +1149,14 @@ impl H265SampleEntryConfig {
 /// - [`VisualSampleEntryFields::data_reference_index`] =
 ///   [`VisualSampleEntryFields::DEFAULT_DATA_REFERENCE_INDEX`]
 /// - [`Hev1Box::unknown_boxes`] = 空 `Vec`
-/// - [`HvccBox::min_spatial_segmentation_idc`] = 0 / [`HvccBox::parallelism_type`] = 0
+/// - [`HvccBox::parallelism_type`] = 0 (PPS 構文が対象外のため)
 /// - [`HvccBox`] の configurationVersion は 1 (encode 側が書く)
 ///
 /// # ストリーム導出値 (先頭 SPS から写す)
 ///
 /// - [`HvccBox`] の profile / level / chroma / bit depth / temporal の各欄
+/// - [`HvccBox::min_spatial_segmentation_idc`]: 先頭 SPS の VUI の同名要素
+///   (VUI に無ければ 0)
 /// - [`VisualSampleEntryFields::width`] / [`VisualSampleEntryFields::height`]:
 ///   先頭 SPS のクロップ適用後の値
 /// - [`HvccBox::nalu_arrays`]: VPS / SPS / PPS の EBSP を入力順で 3 配列に格納
@@ -815,10 +1338,10 @@ fn build_hvcc_box_and_visual(
         general_profile_compatibility_flags: sps.general_profile_compatibility_flags,
         general_constraint_indicator_flags: Uint::new(sps.general_constraint_indicator_flags),
         general_level_idc: sps.general_level_idc,
-        // VUI を読まないため追加制限を付けない。0 は空間分割の下限であり、
+        // 先頭 SPS の VUI にあればその値、無ければ 0。0 は空間分割の下限であり、
         // 活性化される全パラメータセットの最低以下であることを shall とする
         // 8.3.2.1.1 の制約を常に満たす
-        min_spatial_segmentation_idc: Uint::new(0),
+        min_spatial_segmentation_idc: Uint::new(sps.min_spatial_segmentation_idc.unwrap_or(0)),
         // PPS 構文は対象外のため 0 (混合または不明なら 0 に should、8.3.2.1.3)
         parallelism_type: Uint::new(0),
         chroma_format_idc: Uint::new(sps.chroma_format_idc),

@@ -86,6 +86,15 @@ struct SpsBits {
     pic_height_in_luma_samples: u32,
     bit_depth_luma_minus8: u8,
     bit_depth_chroma_minus8: u8,
+    /// `bit_depth_chroma_minus8` より後ろ (VUI まで) を書くか
+    ///
+    /// 書かない場合、パーサーは VUI 由来のフィールドを `None` にして成功する
+    write_tail: bool,
+    /// `vui_timing_info_present_flag == 1` のときの
+    /// (`vui_num_units_in_tick`, `vui_time_scale`)
+    vui_timing: Option<(u32, u32)>,
+    /// `bitstream_restriction_flag == 1` のときの `min_spatial_segmentation_idc`
+    min_spatial_segmentation_idc: Option<u16>,
 }
 
 /// ランダムな SPS パラメタを生成する
@@ -98,6 +107,16 @@ fn sample_sps_bits(ctx: &mut noprop::TestCaseContext) -> SpsBits {
     let sps_max_sub_layers_minus1 = noprop::sample_u64_in(ctx, 0..=6) as u8;
     let sps_temporal_id_nesting_flag = sps_max_sub_layers_minus1 == 0 || noprop::sample_bool(ctx);
     let chroma_format_idc = noprop::sample_u64_in(ctx, 0..=3) as u8;
+    let write_tail = noprop::sample_bool(ctx);
+    // E.2.1 はどちらも 0 より大きいことを要求するので 1 以上から取る
+    let vui_timing = (write_tail && noprop::sample_bool(ctx)).then(|| {
+        (
+            noprop::sample_u64_in(ctx, 1..=u64::from(u32::MAX)) as u32,
+            noprop::sample_u64_in(ctx, 1..=u64::from(u32::MAX)) as u32,
+        )
+    });
+    let min_spatial_segmentation_idc = (write_tail && noprop::sample_bool(ctx))
+        .then(|| noprop::sample_u64_in(ctx, 0..=4095) as u16);
     SpsBits {
         general_profile_space: noprop::sample_u64_in(ctx, 0..=3) as u8,
         general_tier_flag: noprop::sample_bool(ctx),
@@ -115,6 +134,9 @@ fn sample_sps_bits(ctx: &mut noprop::TestCaseContext) -> SpsBits {
         pic_height_in_luma_samples: noprop::sample_u64_in(ctx, 16..=4096) as u32,
         bit_depth_luma_minus8: noprop::sample_u64_in(ctx, 0..=7) as u8,
         bit_depth_chroma_minus8: noprop::sample_u64_in(ctx, 0..=7) as u8,
+        write_tail,
+        vui_timing,
+        min_spatial_segmentation_idc,
     }
 }
 
@@ -182,8 +204,81 @@ fn build_sps(p: &SpsBits) -> Vec<u8> {
     w.push_bit(0); // conformance_window_flag = 0
     w.push_ue(u32::from(p.bit_depth_luma_minus8));
     w.push_ue(u32::from(p.bit_depth_chroma_minus8));
+    if p.write_tail {
+        push_sps_tail(&mut w, p);
+    }
     // ビットライターの出力は RBSP。parse_sps / hvcC 格納の契約は EBSP
     to_ebsp(&w.into_bytes())
+}
+
+/// `bit_depth_chroma_minus8` の続きから VUI までを書き込む (7.3.2.2.1)
+///
+/// VUI までの読み飛ばし構文は最小構成 (scaling list / PCM / `st_ref_pic_set` /
+/// long-term 参照をいずれも持たない) にする。それらを含む構成は
+/// `tests/test_bitstream_h265.rs` の決定的テストで固定している
+fn push_sps_tail(w: &mut BitWriter, p: &SpsBits) {
+    w.push_ue(0); // log2_max_pic_order_cnt_lsb_minus4
+    w.push_bit(0); // sps_sub_layer_ordering_info_present_flag
+    // 非 present なので最上位の sub-layer ぶんだけ書く
+    w.push_ue(1); // sps_max_dec_pic_buffering_minus1
+    w.push_ue(0); // sps_max_num_reorder_pics
+    w.push_ue(0); // sps_max_latency_increase_plus1
+    w.push_ue(0); // log2_min_luma_coding_block_size_minus3
+    w.push_ue(3); // log2_diff_max_min_luma_coding_block_size
+    w.push_ue(0); // log2_min_luma_transform_block_size_minus2
+    w.push_ue(3); // log2_diff_max_min_luma_transform_block_size
+    w.push_ue(0); // max_transform_hierarchy_depth_inter
+    w.push_ue(0); // max_transform_hierarchy_depth_intra
+    w.push_bit(0); // scaling_list_enabled_flag
+    w.push_bit(0); // amp_enabled_flag
+    w.push_bit(1); // sample_adaptive_offset_enabled_flag
+    w.push_bit(0); // pcm_enabled_flag
+    w.push_ue(0); // num_short_term_ref_pic_sets
+    w.push_bit(0); // long_term_ref_pics_present_flag
+    w.push_bit(1); // sps_temporal_mvp_enabled_flag
+    w.push_bit(0); // strong_intra_smoothing_enabled_flag
+
+    if p.vui_timing.is_none() && p.min_spatial_segmentation_idc.is_none() {
+        w.push_bit(0); // vui_parameters_present_flag
+        return;
+    }
+    w.push_bit(1); // vui_parameters_present_flag
+
+    w.push_bit(0); // aspect_ratio_info_present_flag
+    w.push_bit(0); // overscan_info_present_flag
+    w.push_bit(0); // video_signal_type_present_flag
+    w.push_bit(0); // chroma_loc_info_present_flag
+    // 次の 3 つは値が読み飛ばされるだけなので、ゼロ連続を避けて 1 を書く
+    w.push_bit(1); // neutral_chroma_indication_flag
+    w.push_bit(1); // field_seq_flag
+    w.push_bit(1); // frame_field_info_present_flag
+    w.push_bit(0); // default_display_window_flag
+
+    match p.vui_timing {
+        None => w.push_bit(0), // vui_timing_info_present_flag
+        Some((num_units_in_tick, time_scale)) => {
+            w.push_bit(1);
+            w.push_bits(u64::from(num_units_in_tick), 32);
+            w.push_bits(u64::from(time_scale), 32);
+            w.push_bit(0); // vui_poc_proportional_to_timing_flag
+            w.push_bit(0); // vui_hrd_parameters_present_flag
+        }
+    }
+
+    match p.min_spatial_segmentation_idc {
+        None => w.push_bit(0), // bitstream_restriction_flag
+        Some(value) => {
+            w.push_bit(1);
+            w.push_bit(0); // tiles_fixed_structure_flag
+            w.push_bit(1); // motion_vectors_over_pic_boundaries_flag
+            w.push_bit(0); // restricted_ref_pic_lists_flag
+            w.push_ue(u32::from(value)); // min_spatial_segmentation_idc
+            w.push_ue(0); // max_bytes_per_pic_denom
+            w.push_ue(0); // max_bits_per_min_cu_denom
+            w.push_ue(15); // log2_max_mv_length_horizontal
+            w.push_ue(15); // log2_max_mv_length_vertical
+        }
+    }
 }
 
 /// ランダムな NAL 本体を生成する
@@ -387,6 +482,19 @@ fn sps_bit_layout_invariants() -> noprop::TestResult {
         assert_eq!(sps.bit_depth_luma_minus8, bits.bit_depth_luma_minus8);
         assert_eq!(sps.bit_depth_chroma_minus8, bits.bit_depth_chroma_minus8);
 
+        // 末尾を書いていなければ VUI 由来のフィールドは None、
+        // 書いていれば書いた値がそのまま復元される
+        assert_eq!(
+            sps.vui_timing_info
+                .map(|timing| (timing.num_units_in_tick.get(), timing.time_scale.get())),
+            bits.vui_timing,
+            "VUI の timing 情報が一致する"
+        );
+        assert_eq!(
+            sps.min_spatial_segmentation_idc, bits.min_spatial_segmentation_idc,
+            "min_spatial_segmentation_idc が一致する"
+        );
+
         if bits.sps_max_sub_layers_minus1 > 0 {
             sub_layer_cases.set(sub_layer_cases.get() + 1);
         }
@@ -503,8 +611,12 @@ fn build_sample_entry_invariants() -> noprop::TestResult {
             );
         }
 
-        // 固定値
-        assert_eq!(hev1.hvcc_box.min_spatial_segmentation_idc.get(), 0);
+        // ストリーム導出値 (先頭 SPS の VUI にあればその値、無ければ 0)
+        assert_eq!(
+            hev1.hvcc_box.min_spatial_segmentation_idc.get(),
+            bits.min_spatial_segmentation_idc.unwrap_or(0)
+        );
+        // 固定値 (PPS 構文が対象外のため常に 0)
         assert_eq!(hev1.hvcc_box.parallelism_type.get(), 0);
 
         // 呼び出し側指定値 (幅 1 / 2 / 4 → length_size_minus_one = 0 / 1 / 3、
